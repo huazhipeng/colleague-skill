@@ -115,32 +115,83 @@ python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
 
 **私聊采集**（需要 user_access_token + 私聊 chat_id）：
 
-私聊消息需要用户本人授权，步骤：
-1. 飞书应用需开通**用户权限**：`im:message`、`im:chat`
-2. 生成 OAuth 授权链接（替换 APP_ID）：
+私聊消息只能通过用户身份（user_access_token）获取，应用身份无权访问私聊。
+
+**前置条件**：
+
+用户需要提供以下信息：
+1. **飞书应用凭证**：`app_id` 和 `app_secret`（在飞书开放平台创建自建应用获取）
+2. **用户权限**：应用需开通以下用户权限（scope）：
+   - `im:message` — 以用户身份读取/发送消息
+   - `im:chat` — 以用户身份读取会话列表
+3. **OAuth 授权码（code）**：用户在浏览器中完成 OAuth 授权后，从回调 URL 中获取
+
+如果用户缺少以上任何信息，引导他们完成配置。不要假设用户已经配好了。
+
+**获取 user_access_token 的完整流程**：
+
+当用户提供了 app_id、app_secret，并确认已开通用户权限后：
+
+1. 帮用户生成 OAuth 授权链接：
    ```
    https://open.feishu.cn/open-apis/authen/v1/authorize?app_id={APP_ID}&redirect_uri=http://www.example.com&scope=im:message%20im:chat
    ```
-3. 用户在浏览器打开授权，从回调 URL 复制 code
-4. 换取 token：
+   > ⚠️ 注意：`redirect_uri` 需要在飞书应用的「安全设置 → 重定向 URL」中添加 `http://www.example.com`
+   
+2. 用户在浏览器打开链接，登录并授权
+3. 页面会跳转到 `http://www.example.com?code=xxx`，用户复制 code 给你
+4. 用 code 换取 token：
    ```bash
    python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py --exchange-code {CODE}
    ```
-5. 采集私聊（需提供私聊 chat_id，可在发送消息的 API 返回值中获取）：
-   ```bash
-   python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
-     --name "{name}" \
-     --p2p-chat-id oc_xxx \
-     --output-dir ./knowledge/{slug} \
-     --msg-limit 1000
+   或者你自己写 Python 脚本调飞书 API 换取：
+   ```python
+   # 1. 获取 app_access_token
+   POST https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal
+   Body: {"app_id": "xxx", "app_secret": "xxx"}
+   
+   # 2. 用 code 换 user_access_token
+   POST https://open.feishu.cn/open-apis/authen/v1/oidc/access_token
+   Header: Authorization: Bearer {app_access_token}
+   Body: {"grant_type": "authorization_code", "code": "xxx"}
    ```
-6. 也可以直接指定 open_id 跳过用户搜索：
-   ```bash
-   python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
-     --open-id ou_xxx \
-     --p2p-chat-id oc_xxx \
-     --name "{name}"
-   ```
+
+**获取私聊 chat_id**：
+
+用户通常不知道 chat_id。当用户有了 user_access_token 但没有 chat_id 时，你应该**自己写 Python 脚本**来获取：
+
+- **方法**：用 user_access_token 向对方的 open_id 发一条消息，返回值中会包含 chat_id
+  ```python
+  POST https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id
+  Header: Authorization: Bearer {user_access_token}
+  Body: {"receive_id": "{对方open_id}", "msg_type": "text", "content": "{\"text\":\"你好\"}"}
+  # 返回值中的 chat_id 就是私聊会话 ID
+  ```
+- **注意**：`GET /im/v1/chats` 不会返回私聊会话，这是飞书 API 的限制，不是权限问题，不要尝试用这个接口找私聊
+- 如果用户不知道对方的 open_id，可以用 tenant_access_token 调通讯录 API 搜索：
+  ```python
+  GET https://open.feishu.cn/open-apis/contact/v3/scopes
+  # 返回应用可见范围内所有用户的 open_id
+  ```
+
+**执行采集**：
+
+拿到 user_access_token 和 chat_id 后：
+```bash
+python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
+  --open-id {对方open_id} \
+  --p2p-chat-id {chat_id} \
+  --user-token {user_access_token} \
+  --name "{name}" \
+  --output-dir ./knowledge/{slug} \
+  --msg-limit 1000
+```
+
+**灵活性原则**：以上 API 调用不一定要用 collector 脚本，如果脚本跑不通或者场景不匹配，你可以直接写 Python 脚本调飞书 API 完成任务。核心 API 参考：
+- 获取 token：`POST /auth/v3/app_access_token/internal`、`POST /authen/v1/oidc/access_token`
+- 发消息（获取 chat_id）：`POST /im/v1/messages?receive_id_type=open_id`
+- 拉消息：`GET /im/v1/messages?container_id_type=chat&container_id={chat_id}`
+- 查通讯录：`GET /contact/v3/scopes`、`GET /contact/v3/users/{user_id}`
 
 自动采集内容：
 - 群聊：所有与他共同群聊中他发出的消息（过滤系统消息、表情包）
@@ -153,10 +204,10 @@ python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
 - `knowledge/{slug}/docs.txt` → 文档内容
 - `knowledge/{slug}/collection_summary.json` → 采集摘要
 
-如果采集失败，告知用户检查：
-- 群聊采集：bot 是否已添加到相关群聊
-- 私聊采集：是否已配置 user_access_token 和 p2p_chat_id
-- 权限：应用是否开通了 im:message 和 im:chat 用户权限
+如果采集失败，根据报错自行判断原因并尝试修复，常见问题：
+- 群聊采集：bot 未添加到群聊
+- 私聊采集：user_access_token 过期（有效期 2 小时，可用 refresh_token 刷新）
+- 权限不足：引导用户在飞书开放平台开通对应权限并重新授权
 - 或改用方式 B/C
 
 ---
@@ -564,31 +615,83 @@ python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
 
 **Private chat (P2P) collection** (requires user_access_token + p2p chat_id):
 
-Private messages require user authorization:
-1. Enable **user scopes** in Feishu app: `im:message`, `im:chat`
-2. Generate OAuth URL (replace APP_ID):
+Private messages can only be accessed via user identity (user_access_token). App identity cannot access private chats.
+
+**Prerequisites**:
+
+The user needs to provide:
+1. **Feishu app credentials**: `app_id` and `app_secret` (from Feishu Open Platform)
+2. **User scopes**: The app must have these user scopes enabled:
+   - `im:message` — read/send messages as user
+   - `im:chat` — read chat list as user
+3. **OAuth authorization code**: obtained after user completes OAuth in browser
+
+If the user is missing any of these, guide them through setup. Don't assume anything is pre-configured.
+
+**Getting user_access_token**:
+
+Once the user provides app_id, app_secret, and confirms scopes are enabled:
+
+1. Generate the OAuth URL for them:
    ```
    https://open.feishu.cn/open-apis/authen/v1/authorize?app_id={APP_ID}&redirect_uri=http://www.example.com&scope=im:message%20im:chat
    ```
-3. User opens URL in browser, authorizes, copies code from callback URL
+   > ⚠️ The redirect_uri must be added in the app's "Security Settings → Redirect URLs"
+
+2. User opens URL, logs in, authorizes
+3. Page redirects to `http://www.example.com?code=xxx`, user copies the code
 4. Exchange code for token:
    ```bash
    python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py --exchange-code {CODE}
    ```
-5. Collect with p2p chat_id:
-   ```bash
-   python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
-     --name "{name}" \
-     --p2p-chat-id oc_xxx \
-     --output-dir ./knowledge/{slug}
+   Or write a Python script to call the Feishu API directly:
+   ```python
+   # 1. Get app_access_token
+   POST https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal
+   Body: {"app_id": "xxx", "app_secret": "xxx"}
+   
+   # 2. Exchange code for user_access_token
+   POST https://open.feishu.cn/open-apis/authen/v1/oidc/access_token
+   Header: Authorization: Bearer {app_access_token}
+   Body: {"grant_type": "authorization_code", "code": "xxx"}
    ```
-6. Or skip user search by providing open_id directly:
-   ```bash
-   python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
-     --open-id ou_xxx \
-     --p2p-chat-id oc_xxx \
-     --name "{name}"
-   ```
+
+**Getting the p2p chat_id**:
+
+Users typically don't know their chat_id. When the user has a user_access_token but no chat_id, **write a Python script yourself** to obtain it:
+
+- **Method**: Send a message to the other user's open_id — the response includes the chat_id
+  ```python
+  POST https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id
+  Header: Authorization: Bearer {user_access_token}
+  Body: {"receive_id": "{target_open_id}", "msg_type": "text", "content": "{\"text\":\"hello\"}"}
+  # The chat_id in the response is the p2p chat ID
+  ```
+- **Important**: `GET /im/v1/chats` does NOT return p2p chats — this is a Feishu API limitation, not a permission issue. Do not try to use it for finding private chats.
+- If the user doesn't know the target's open_id, use tenant_access_token to search contacts:
+  ```python
+  GET https://open.feishu.cn/open-apis/contact/v3/scopes
+  # Returns open_ids of all users visible to the app
+  ```
+
+**Running collection**:
+
+Once you have user_access_token and chat_id:
+```bash
+python3 ${CLAUDE_SKILL_DIR}/tools/feishu_auto_collector.py \
+  --open-id {target_open_id} \
+  --p2p-chat-id {chat_id} \
+  --user-token {user_access_token} \
+  --name "{name}" \
+  --output-dir ./knowledge/{slug} \
+  --msg-limit 1000
+```
+
+**Flexibility principle**: The above API calls don't have to go through the collector script. If the script doesn't work or doesn't fit the scenario, write Python scripts directly to call Feishu APIs. Key API reference:
+- Get token: `POST /auth/v3/app_access_token/internal`, `POST /authen/v1/oidc/access_token`
+- Send message (get chat_id): `POST /im/v1/messages?receive_id_type=open_id`
+- Fetch messages: `GET /im/v1/messages?container_id_type=chat&container_id={chat_id}`
+- Search contacts: `GET /contact/v3/scopes`, `GET /contact/v3/users/{user_id}`
 
 Auto-collected content:
 - Group chats: messages sent by them (system messages and stickers filtered)
@@ -601,10 +704,10 @@ After collection, `Read` the output files:
 - `knowledge/{slug}/docs.txt` → document content
 - `knowledge/{slug}/collection_summary.json` → collection summary
 
-If collection fails, check:
-- Group chat: bot must be added to relevant group chats
-- Private chat: user_access_token and p2p_chat_id must be configured
-- Permissions: app must have im:message and im:chat user scopes enabled
+If collection fails, diagnose the error and attempt to fix it. Common issues:
+- Group chat: bot not added to the group
+- Private chat: user_access_token expired (2-hour TTL, refresh with refresh_token)
+- Insufficient permissions: guide user to enable scopes and re-authorize
 - Or switch to Option B/C
 
 ---
